@@ -178,10 +178,10 @@ def security_events(
         "auth":     ("auth",     "auth.log"),
         "messages": ("messages", "messages"),
     }
-    targets = source_map.items() if source == "all" else [(source, source_map.get(source, (source, source))[1])]
+    targets = list(source_map.values()) if source == "all" else [(source, source_map[source][1])]
 
     parts = []
-    for src_name, logfile in (targets if source == "all" else [(source, source_map[source][1])]):
+    for src_name, logfile in targets:
         p = LOG_DIR / logfile
         if not p.exists():
             parts.append(f"[{src_name}] not found: {p}")
