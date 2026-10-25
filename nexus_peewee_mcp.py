@@ -57,40 +57,84 @@ _SYSTEM = (
     "Be concise, precise, and actionable. No filler. Security and sovereignty first."
 )
 
-# ── Smart routing table ───────────────────────────────────────────────────────
-# Maps task type → (provider, model)
-# Provider keys must match Bifrost's /api/llm/<provider> routes
-_ROUTES = {
-    "vision":    ("google",      "gemini-2.0-flash"),       # image understanding
-    "code":      ("deepseek",    "deepseek-chat"),           # code gen/debug
-    "reason":    ("groq",        "llama-3.3-70b-versatile"), # analysis/reasoning
-    "security":  ("deepseek",    "deepseek-chat"),           # security analysis
-    "nexus":     ("nexus-router","auto"),                    # NeXuS-specific (Merlin)
-    "fast":      ("groq",        "llama-3.1-8b-instant"),    # quick responses
-    "chat":      ("pollinations","openai"),                  # general chat
-    "image_gen": ("pollinations", None),                    # image generation
-    "audio":     ("pollinations", None),                    # TTS/audio
+# ── Modal definitions ─────────────────────────────────────────────────────────
+# Each modal has a number, name, keywords, provider, model, and handler type.
+# handler: "llm" = chat completion, "image" = image gen, "video" = video gen,
+#          "audio" = TTS/audio gen, "vision" = multimodal LLM with image input
+
+MODALS = {
+    1:  {"name": "image_gen",  "label": "Image Generation",
+         "keywords": ["image","generate image","make image","draw","paint","create image","img","picture of","visualize","render"],
+         "provider": "pollinations", "model": "flux",
+         "handler": "image"},
+
+    2:  {"name": "video_gen",  "label": "Video Generation",
+         "keywords": ["video","animate","animation","motion","clip","movie","veo","seedance","wan"],
+         "provider": "pollinations", "model": "veo",
+         "handler": "video"},
+
+    3:  {"name": "audio_tts",  "label": "Audio / TTS",
+         "keywords": ["audio","speak","say","voice","tts","text to speech","narrate","read aloud","sound","music"],
+         "provider": "pollinations", "model": "openai-audio",
+         "handler": "audio"},
+
+    4:  {"name": "vision",     "label": "Vision / Image Analysis",
+         "keywords": ["screenshot","look at","analyze image","what is in","describe","ocr","read image","what does this","examine","see this"],
+         "provider": "google",       "model": "gemini-2.0-flash",
+         "handler": "vision"},
+
+    5:  {"name": "code",       "label": "Code",
+         "keywords": ["code","function","script","bug","debug","implement","class","python","go","rust","javascript","typescript","fix the","write a","refactor"],
+         "provider": "deepseek",     "model": "deepseek-chat",
+         "handler": "llm"},
+
+    6:  {"name": "security",   "label": "Security",
+         "keywords": ["security","threat","attack","vulnerability","fail2ban","psad","firewall","intrusion","malware","exploit","cve","breach"],
+         "provider": "deepseek",     "model": "deepseek-chat",
+         "handler": "llm"},
+
+    7:  {"name": "nexus",      "label": "NeXuS System",
+         "keywords": ["nexus","bifrost","merlin","darknet","tor","i2p","divachain","nexium","sovereign","nncc","alpine","openrc"],
+         "provider": "nexus-router", "model": "auto",
+         "handler": "llm"},
+
+    8:  {"name": "reason",     "label": "Reasoning / Analysis",
+         "keywords": ["why","explain","analyze","compare","reason","think through","pros and cons","trade-off","architecture","plan","design"],
+         "provider": "groq",         "model": "llama-3.3-70b-versatile",
+         "handler": "llm"},
+
+    9:  {"name": "fast",       "label": "Quick Response",
+         "keywords": ["quick","briefly","one line","tldr","what is","define","summarize"],
+         "provider": "groq",         "model": "llama-3.1-8b-instant",
+         "handler": "llm"},
+
+    0:  {"name": "chat",       "label": "General Chat",
+         "keywords": [],
+         "provider": "pollinations", "model": "openai",
+         "handler": "llm"},
 }
 
-_TASK_KEYWORDS = {
-    "vision":   ["screenshot","image","picture","photo","look at","see","visual","diagram","chart","describe image"],
-    "code":     ["code","function","script","bug","debug","implement","class","python","go","rust","javascript","typescript","fix the","write a"],
-    "reason":   ["why","explain","analyze","compare","reason","think through","pros and cons","trade-off","architecture"],
-    "security": ["security","threat","attack","vulnerability","fail2ban","psad","firewall","intrusion","malware","exploit","cve"],
-    "nexus":    ["nexus","bifrost","merlin","darknet","tor","i2p","divachain","nexium","sovereign","nncc"],
-    "fast":     ["quick","briefly","one line","tldr","what is","define"],
-}
+# Keyword → modal number for O(1) lookup at runtime
+_KEYWORD_MAP: dict[str, int] = {}
+for _num, _m in MODALS.items():
+    for _kw in _m["keywords"]:
+        _KEYWORD_MAP[_kw] = _num
+
+# Legacy route aliases for backward compat
+_ROUTES = {m["name"]: (m["provider"], m["model"]) for m in MODALS.values()}
 
 
-def _classify(text: str) -> str:
-    """Classify task type from prompt text."""
+def _classify(text: str) -> tuple[int, dict]:
+    """Return (modal_number, modal_def) for the given text."""
     if PEEWEE_OVERRIDE:
-        return PEEWEE_OVERRIDE
+        for num, m in MODALS.items():
+            if m["name"] == PEEWEE_OVERRIDE:
+                return num, m
     t = text.lower()
-    for task, keywords in _TASK_KEYWORDS.items():
-        if any(k in t for k in keywords):
-            return task
-    return "chat"
+    for kw, num in _KEYWORD_MAP.items():
+        if kw in t:
+            return num, MODALS[num]
+    return 0, MODALS[0]  # default: chat
 
 
 def _llm_url(provider: str) -> str:
@@ -107,13 +151,22 @@ def _post(url: str, payload: dict, timeout: int = 90) -> dict:
 
 
 def _ask(prompt: str, system: str = _SYSTEM,
-         task_hint: str = "", image_b64: str = "", image_mime: str = "") -> str:
+         modal_hint: int = -1, image_b64: str = "", image_mime: str = "") -> str:
     """
-    Core inference. Classifies the task, selects best provider/model,
+    Core inference. Classifies the task into a modal, selects provider/model,
     calls Bifrost. Supports vision via base64 image attachment.
     """
-    task     = task_hint or _classify(prompt)
-    provider, model = _ROUTES.get(task, _ROUTES["chat"])
+    if modal_hint >= 0:
+        modal = MODALS.get(modal_hint, MODALS[0])
+    else:
+        _, modal = _classify(prompt)
+
+    # Vision override if image attached
+    if image_b64 and modal["handler"] != "vision":
+        modal = MODALS[4]
+
+    provider = modal["provider"]
+    model    = modal["model"]
 
     # Build messages
     user_content: object
@@ -195,9 +248,10 @@ def ask_peewee(question: str) -> str:
     injects relevant live system context, and returns an answer.
     Covers: system ops, code, security, NeXuS services, general reasoning.
     """
-    ctx  = _auto_context(question)
+    modal_num, modal = _classify(question)
+    ctx    = _auto_context(question)
     prompt = f"{ctx}\n\nQuestion: {question}" if ctx else question
-    return _ask(prompt, task_hint=_classify(question))
+    return _ask(prompt, modal_hint=modal_num)
 
 
 @app.tool()
@@ -214,7 +268,7 @@ def analyze_image(path: str, question: str = "Describe what you see. Note any is
     mime = mimetypes.guess_type(str(p))[0] or "image/png"
     b64  = base64.b64encode(p.read_bytes()).decode()
 
-    return _ask(question, task_hint="vision", image_b64=b64, image_mime=mime)
+    return _ask(question, modal_hint=4, image_b64=b64, image_mime=mime)
 
 
 @app.tool()
@@ -253,7 +307,7 @@ def diagnose(symptom: str) -> str:
         ("Top Processes",   _trim(running_processes("cpu", 10), 600)),
     )
     prompt = f"{ctx}\n\nSymptom: {symptom}\n\nDiagnose and give a specific fix."
-    return _ask(prompt, task_hint="reason")
+    return _ask(prompt, modal_hint=8)
 
 
 @app.tool()
@@ -270,7 +324,7 @@ def node_brief() -> str:
     )
     prompt = (f"{ctx}\n\nGive a brief node health summary. "
               f"What's healthy, what needs attention, any anomalies? 3-5 sentences.")
-    return _ask(prompt, task_hint="reason")
+    return _ask(prompt, modal_hint=8)
 
 
 @app.tool()
@@ -286,7 +340,7 @@ def security_analysis(depth: Literal["quick", "full"] = "quick") -> str:
     )
     prompt = (f"{ctx}\n\nSecurity threat assessment: What attacks or anomalies are present? "
               f"Rate severity (low/medium/high). Give 1-2 specific recommendations.")
-    return _ask(prompt, task_hint="security")
+    return _ask(prompt, modal_hint=6)
 
 
 @app.tool()
@@ -311,7 +365,7 @@ def service_advice(service: str) -> str:
     ctx    = _ctx(*layers)
     prompt = (f"{ctx}\n\nIs {service} healthy? If not, what's wrong "
               f"and what's the fix? Include the exact command.")
-    return _ask(prompt, task_hint="nexus")
+    return _ask(prompt, modal_hint=7)
 
 
 @app.tool()
@@ -320,12 +374,18 @@ def route_info() -> str:
     Show Peewee's current routing table — which LLM handles which task type.
     Useful for understanding how she distributes work across providers.
     """
-    lines = ["Peewee Smart Router — current routing:\n"]
-    for task, (provider, model) in _ROUTES.items():
-        lines.append(f"  {task:<12} → {provider}/{model or 'default'}")
-    lines.append(f"\nBifrost base: {BIFROST_BASE}")
+    lines = ["Peewee Modal Router — current routing:\n",
+             f"  {'#':<4} {'Modal':<14} {'Handler':<8} {'Provider':<16} Model",
+             f"  {'-'*60}"]
+    for num, m in sorted(MODALS.items()):
+        kws = ", ".join(m["keywords"][:4]) + ("…" if len(m["keywords"]) > 4 else "")
+        lines.append(f"  {num:<4} {m['label']:<14} {m['handler']:<8} "
+                     f"{m['provider']:<16} {m['model'] or 'default'}")
+        if kws:
+            lines.append(f"       keywords: {kws}")
+    lines.append(f"\nBifrost: {BIFROST_BASE}")
     if PEEWEE_OVERRIDE:
-        lines.append(f"Override active: {PEEWEE_OVERRIDE}")
+        lines.append(f"Override: {PEEWEE_OVERRIDE}")
     return "\n".join(lines)
 
 
