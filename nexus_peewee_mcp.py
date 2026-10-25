@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
 nexus_peewee_mcp.py — NeXuS Peewee intelligence layer MCP server
-Wraps a small local model (Peewee) with live data from nexus-monitor as context.
+Wraps a capable LLM (via Bifrost) with live data from nexus-monitor as context.
 Peewee reasons about system state; nexus-monitor is the data layer.
 
 Register: claude mcp add nexus-peewee -- ~/.venv/nexus-mcp/bin/python \
               ~/NeXuS/projects/nexus-mcp-monitor/nexus_peewee_mcp.py
 
 Env vars:
-  PEEWEE_MODEL   — aichat model string (default: ollama:smollm2:360m-instruct-q4_K_M)
-  AICHAT_BASE    — aichat --serve base URL (default: http://127.0.0.1:3030)
+  PEEWEE_MODEL    — model name passed to Bifrost (default: openai)
+  BIFROST_BASE    — Bifrost proxy base URL (default: https://localhost:8443)
+  BIFROST_PROVIDER— Bifrost provider key (default: pollinations)
+  AICHAT_BASE     — legacy aichat fallback if BIFROST_BASE is unset
 """
 
 import json
 import os
+import ssl
 import sys
 import urllib.error
 import urllib.request
@@ -34,8 +37,18 @@ from mcp.server.mcpserver import MCPServer
 
 app = MCPServer("nexus-peewee")
 
-PEEWEE_MODEL = os.environ.get("PEEWEE_MODEL", "ollama:smollm2:360m-instruct-q4_K_M")
-AICHAT_BASE  = os.environ.get("AICHAT_BASE",  "http://127.0.0.1:3030")
+PEEWEE_MODEL     = os.environ.get("PEEWEE_MODEL",     "openai")
+BIFROST_BASE     = os.environ.get("BIFROST_BASE",     "https://localhost:8443")
+BIFROST_PROVIDER = os.environ.get("BIFROST_PROVIDER", "pollinations")
+AICHAT_BASE      = os.environ.get("AICHAT_BASE",      "http://127.0.0.1:3030")
+
+# Build the endpoint: Bifrost takes priority over legacy aichat
+_BIFROST_ENDPOINT = f"{BIFROST_BASE}/api/llm/{BIFROST_PROVIDER}/v1/chat/completions"
+
+# TLS context — trust self-signed Bifrost cert for localhost
+_TLS_CTX = ssl.create_default_context()
+_TLS_CTX.check_hostname = False
+_TLS_CTX.verify_mode    = ssl.CERT_NONE
 
 SYSTEM_PROMPT = (
     "You are Peewee, the NeXuS node intelligence layer. "
@@ -58,20 +71,38 @@ def _ask(user: str, system: str = SYSTEM_PROMPT, model: str = PEEWEE_MODEL) -> s
         "stream": False,
     }).encode()
 
+    # Try Bifrost first
     req = urllib.request.Request(
+        _BIFROST_ENDPOINT,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60, context=_TLS_CTX) as resp:
+            data = json.loads(resp.read())
+            return data["choices"][0]["message"]["content"].strip()
+    except urllib.error.URLError:
+        pass  # fall through to aichat
+    except (KeyError, json.JSONDecodeError) as e:
+        return f"[Peewee response parse error: {e}]"
+
+    # Fallback: legacy aichat --serve
+    req2 = urllib.request.Request(
         f"{AICHAT_BASE}/v1/chat/completions",
         data=payload,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req2, timeout=60) as resp:
             data = json.loads(resp.read())
             return data["choices"][0]["message"]["content"].strip()
     except urllib.error.URLError as e:
         return (
-            f"[Peewee offline — aichat --serve not running at {AICHAT_BASE}]\n"
-            f"Start it with: aichat --serve\n"
+            f"[Peewee offline — Bifrost not reachable at {_BIFROST_ENDPOINT} "
+            f"and aichat not running at {AICHAT_BASE}]\n"
+            f"Start Bifrost: cd ~/NeXuS/bifrost-bridge/server && python3 nexus_web_server.py --root ../web --port 8443\n"
             f"Error: {e}"
         )
     except (KeyError, json.JSONDecodeError) as e:
